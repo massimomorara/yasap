@@ -539,14 +539,13 @@ class audioPlayer
          AVFrame *  aFrm { av_frame_alloc() };
 
          int        fc { 0 };
-         int        cnt { 0 };
 
          if ( nullptr == aFrm )
             throw std::runtime_error("error allocating audio frame");
 
          SDL_PauseAudioDevice(ad.devId, pause);
 
-         for ( ; aLoop ; ++cnt )
+         while ( aLoop )
           {
             // pause mutex safe area
              {
