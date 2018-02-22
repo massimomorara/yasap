@@ -3,7 +3,7 @@
 
 Yasap is a simple command line audio player that uses FFmpeg and SDL2 libraries.
 
-Written in C++14, in a Linux Debian stable (stretch) platform, should be easily portable in other Linux/Unix fairly recently platforms.
+Written in C++14, in a Linux Debian stable (stretch) platform, should be easily portable in others fairly recently Linux/Unix platforms.
 
 The code is in a unique C++14 source file (`yasap.cpp`) and a simple `Makefile` show how to compile it and which libraries to link.
 
