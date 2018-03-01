@@ -1,0 +1,11 @@
+
+0.0.2 - 2018.03.01
+
+- format conversion support added
+- file and format print info added
+- minor changes
+
+0.0.1 - 2018.02.22
+
+- first public release
+

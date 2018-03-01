@@ -1,7 +1,7 @@
 
 #if 0
 
-YASAP 0.0.1 - Yet Another Simple Audio Player
+YASAP 0.0.2 - Yet Another Simple Audio Player
 
 Copyright (c) 2018 massimo morara
 
@@ -30,7 +30,6 @@ authorization.
 
 #endif
 
-#include <map>
 #include <queue>
 #include <mutex>
 #include <atomic>
@@ -42,12 +41,14 @@ authorization.
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 #include <condition_variable>
 
 extern "C"
  {
    #include <SDL2/SDL.h>
    #include <libavformat/avformat.h>
+   #include <libswresample/swresample.h>
  }
 
 #include <unistd.h>
@@ -116,9 +117,17 @@ void sdl_audio_callback (void *, std::uint8_t *, int);
 
 struct audioData
  {
+   // static data 
+   static std::unordered_map<AVSampleFormat, int> const formM;
+   static constexpr AVSampleFormat defFfmpegFormat { AV_SAMPLE_FMT_S16 };
+   static constexpr int defSdlFormat { AUDIO_S16SYS };
+   static constexpr int maxOutFrames { 1 << 16 };
+
    // ffmpeg data
    AVFormatContext *  frmCtx   { nullptr };
    AVCodecContext  *  codecCtx { nullptr };
+   SwrContext *       swrCtx   { nullptr };
+   std::uint8_t *     swrBuff  { nullptr };
    int                aStreamI { -1 }; 
 
    // sdl data
@@ -138,6 +147,9 @@ struct audioData
    // time position / time base data
    std::size_t   lenF, lenH, lenM, lenS;
    std::int64_t  tbNum, tbDen;
+
+   // other data
+   bool frmConv  { false };  // is format conversion needed?
 
    audioData ()
     { };
@@ -196,10 +208,24 @@ struct audioData
          throw std::runtime_error(  "error initializing SDL: "s
                                   + SDL_GetError());
 
+      char const * nmPtr { av_get_sample_fmt_name(codecCtx->sample_fmt) };
+
+      std::cout << "- filename: " << fileName << std::endl;
+      std::cout << "- audio codec: " << codec->long_name << std::endl;
+      std::cout << "- sample format: " << ( nmPtr ? nmPtr : "unrecognized" )
+         << std::endl;
+      std::cout << "- # of channels: " << codecCtx->channels << std::endl;
+      std::cout << "- sample rate: " << codecCtx->sample_rate << " Hz"
+         << std::endl;
+
+      auto const iFrm { formM.find(codecCtx->sample_fmt) };
+
       SDL_AudioSpec req;
 
       req.freq     = codecCtx->sample_rate;
-      req.format   = AUDIO_S16SYS;
+      req.format   = ( iFrm != formM.cend()
+                      ? iFrm->second
+                      : (frmConv = true, defSdlFormat) );
       req.channels = codecCtx->channels;
       req.silence  = 0;
       req.samples  = 1024;
@@ -209,6 +235,29 @@ struct audioData
       if ( 0 == (devId = SDL_OpenAudioDevice(nullptr, 0, &req, &aSpc,
                                              SDL_AUDIO_ALLOW_ANY_CHANGE)) )
          throw std::runtime_error("error opening SDL");
+
+      if (   (req.freq     != aSpc.freq)
+          || (req.format   != aSpc.format)
+          || (req.channels != aSpc.channels) )
+         throw std::runtime_error("SDL specs device error");
+      
+      if ( true == frmConv )
+       {
+         if ( nullptr == (swrCtx
+            = swr_alloc_set_opts(nullptr, codecCtx->channel_layout,
+                                 defFfmpegFormat, codecCtx->sample_rate,
+                                 codecCtx->channel_layout,
+                                 codecCtx->sample_fmt,
+                                 codecCtx->sample_rate, 0, nullptr) ) )
+            throw std::runtime_error("error setting swr context");
+
+         if ( 0 > swr_init(swrCtx) )
+            throw std::runtime_error("error initializing swr context");
+
+         if ( 0 > av_samples_alloc(&swrBuff, nullptr, aSpc.channels,
+                                   maxOutFrames, defFfmpegFormat, 0) )
+            throw std::runtime_error("error allocating swr buffer");
+       }
     }
 
    void sdl_acb (std::uint8_t * stream, int len)
@@ -285,10 +334,18 @@ struct audioData
     {
       SDL_Quit();
 
+      av_free(swrBuff);
+      swr_free(&swrCtx);
       avcodec_free_context(&codecCtx);
       avformat_close_input(&frmCtx);
     }
  };
+
+std::unordered_map<AVSampleFormat, int> const audioData::formM
+ { { AV_SAMPLE_FMT_U8,  AUDIO_U8 },
+   { AV_SAMPLE_FMT_S16, AUDIO_S16SYS },
+   { AV_SAMPLE_FMT_S32, AUDIO_S32SYS },
+   { AV_SAMPLE_FMT_FLT, AUDIO_F32SYS } }; 
 
 
 void sdl_audio_callback (void * userdata, std::uint8_t * stream, int len)
@@ -308,7 +365,7 @@ class keybHandl
 
       termios oldT;
 
-      std::map<std::string, key>  km;
+      std::unordered_map<std::string, key>  km;
 
       void addSpecialKey (char const id[3U], key const & localKey)
        {
@@ -386,7 +443,7 @@ class keybHandl
           }
        }
 
-      std::map<std::string, key> const & getKm () const 
+      auto const & getKm () const 
        { return km; } 
  };
 
@@ -565,18 +622,58 @@ class audioPlayer
                   if ( 0 > decodeAV(*ad.codecCtx, *aFrm, fc, aPck) )
                      std::cerr << "error from decodeAV()" << std::endl;
 
-                  if ( fc )  // if frame completed
+                  // if frame completed
+                  if ( fc )
                    {
-                     auto const size
-                      { av_samples_get_buffer_size
+                     // if format conversion required
+                     if ( true == ad.frmConv )
+                      {
+                        int  inSmpl { aFrm->nb_samples };
+                        int  outSmpl;
+
+                        do
+                         {
+                           outSmpl = swr_convert(ad.swrCtx, &ad.swrBuff,
+                                        ad.maxOutFrames,
+                                        (std::uint8_t const **) aFrm->data,
+                                        inSmpl);
+
+                           if ( 0 < outSmpl )
+                            {
+                              auto const size
+                               { av_samples_get_buffer_size
+                                 (nullptr, ad.codecCtx->channels,
+                                  outSmpl, ad.defFfmpegFormat, 1) };
+
+                              std::vector<std::uint8_t> vc(size);
+
+                              std::copy(ad.swrBuff, ad.swrBuff+size,
+                                        vc.data());
+
+                              ad.cb.push(std::move(vc), aPck.pts);
+                            }
+                           else if ( 0 > outSmpl )
+                              std::cerr << "error " << outSmpl
+                                 << " swr converting" << std::endl;
+
+                           inSmpl = 0;
+                         }
+                        while ( outSmpl == ad.maxOutFrames );
+                      }
+                     else
+                      {
+                        auto const size
+                         { av_samples_get_buffer_size
                            (nullptr, ad.codecCtx->channels,
-                            aFrm->nb_samples, AV_SAMPLE_FMT_S16, 1) };
+                            aFrm->nb_samples, ad.codecCtx->sample_fmt, 1) };
 
-                     std::vector<std::uint8_t> vc(size);
+                        std::vector<std::uint8_t> vc(size);
 
-                     std::copy(*(aFrm->data), *(aFrm->data)+size, vc.data());
+                        std::copy(*(aFrm->data), *(aFrm->data)+size,
+                                  vc.data());
 
-                     ad.cb.push(std::move(vc), aPck.pts);
+                        ad.cb.push(std::move(vc), aPck.pts);
+                      }
                    }
                 }
 
