@@ -32,7 +32,8 @@ CFLAGS    = -c -g -MD -MP -Wall -ansi -pedantic -std=c++14 -I. ${DEFINES}
 
 LD        = g++
 LDFLAGS   = -std=c++14
-LDLIBS    = -lSDL2 -lavformat -lavcodec -lavutil -lncurses -lpthread
+LDLIBS    = -lSDL2 -lavformat -lavcodec -lavutil -lswresample -lncurses \
+	    -lpthread
 
 OBJS = yasap.o
 
