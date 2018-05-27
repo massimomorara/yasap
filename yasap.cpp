@@ -1,7 +1,7 @@
 
 #if 0
 
-YASAP 0.0.2 - Yet Another Simple Audio Player
+YASAP 0.1.0 - Yet Another Simple Audio Player
 
 Copyright (c) 2018 massimo morara
 
@@ -30,14 +30,17 @@ authorization.
 
 #endif
 
-#include <queue>
+#include <array>
 #include <mutex>
+#include <queue>
 #include <atomic>
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <vector>
 #include <cstring>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
@@ -85,8 +88,8 @@ class cBuffer
        {
          std::unique_lock<decltype(m)> l{m};
 
-         bool b { cvNe.wait_for(l, d,
-                                [this]{ return false == q.empty(); }) };
+         bool const b { cvNe.wait_for(l, d,
+                           [this]{ return false == q.empty(); }) };
 
          if ( b )
           {
@@ -141,6 +144,9 @@ struct audioData
    buffData                   bd;
    std::size_t                vp      { 0U };
    std::size_t                oldPosS = -1;
+   std::atomic<std::int64_t>  ptrkPos { 0 };  // prev track starting pos
+   std::int64_t               ttrkPos { 0 };  // this track starting pos
+   std::atomic<std::int64_t>  ntrkPos { 0 };  // next track starting pos
    std::atomic<bool>          aPurged { false };
    std::atomic<std::int64_t>  aPos    { 0 };
 
@@ -148,11 +154,124 @@ struct audioData
    std::size_t   lenF, lenH, lenM, lenS;
    std::int64_t  tbNum, tbDen;
 
+   // tracks data (if any)
+   std::vector<std::pair<std::int64_t, std::string>>  tracksData;
+   std::size_t                                        numTracks  { 0U };
+
    // other data
-   bool frmConv  { false };  // is format conversion needed?
+   std::atomic<bool> toQuit   { false };  // is required to quit now?
+   bool              frmConv  { false };  // is format conversion needed?
 
    audioData ()
     { };
+
+   static std::string getFileName (std::string const & str)
+    {
+      std::string ret;
+
+      for ( auto const & ch : str )
+         if ( (ch == '\\') || (ch == '/' ) )
+             ret.clear();
+         else
+             ret.push_back(ch);
+
+      return ret;
+    }
+
+   static std::string toLower (std::string str)
+    {
+      static constexpr char diffCase { 'a' - 'A' };
+
+      for ( auto & ch : str )
+         if ( (ch >= 'A') && (ch <= 'Z') )
+            ch += diffCase;
+
+      return str;
+    }
+
+   void addTrack (std::string const & writ, std::string const & perf,
+                  std::string const & titl, std::int64_t strt)
+    {
+      std::string  str;
+
+      if ( (false == writ.empty()) && (false == perf.empty()) )
+         str = writ + " (perf. " + perf + ")";
+      else
+         str = writ + perf;
+
+      if ( false == str.empty() )
+         str += " - ";
+
+      if ( titl.empty() )
+         str += "track " + std::to_string(tracksData.size()+1U);
+      else
+         str += titl;
+
+      tracksData.emplace_back(strt, std::move(str));
+    }
+
+   void setTracksData (std::string const & str)
+    {
+      bool                tracksZone{false}, indexed{false};
+      std::int64_t        strt{0};
+      std::string         line;
+      std::string         cueCommand;
+      std::string         writ, perf, titl;
+      std::istringstream  issf{str};
+
+      while ( std::getline(issf, line) )
+       {
+         std::istringstream  issl{line};
+
+         if ( issl >> cueCommand )
+          {
+            auto const lowC { toLower(cueCommand) };
+
+            if ( "track" == lowC )
+             {
+               if ( tracksZone )
+                  addTrack(writ, perf, titl, strt);
+               else
+                  tracksZone = true;
+
+               indexed = false;
+               strt    = 0;
+
+               writ.clear();
+               perf.clear();
+               titl.clear();
+             }
+            else if ( false == tracksZone )
+               ;
+            else if ( "songwriter" == lowC )
+               issl >> std::quoted(writ);
+            else if ( "performer" == lowC )
+               issl >> std::quoted(perf);
+            else if ( "title" == lowC )
+               issl >> std::quoted(titl);
+            else if ( ("index" == lowC) && (false == indexed) )
+             {
+               indexed = true;
+
+               char  ch1, ch2;
+               int   numI, mm, ss, ff;
+
+               issl >> numI >> mm >> ch1 >> ss >> ch2 >> ff;
+
+               strt = ((mm*60.0 + ss + ff/75.0) * tbDen) / tbNum;
+             }
+          }
+       }
+
+      if ( tracksZone )
+       {
+         // add last track data
+         addTrack(writ, perf, titl, strt);
+
+         // memorize num of tracks
+         numTracks = tracksData.size();
+       }
+    }
 
    void initialize (std::string const & fileName)
     {
@@ -210,13 +329,40 @@ struct audioData
 
       char const * nmPtr { av_get_sample_fmt_name(codecCtx->sample_fmt) };
 
-      std::cout << "- filename: " << fileName << std::endl;
-      std::cout << "- audio codec: " << codec->long_name << std::endl;
-      std::cout << "- sample format: " << ( nmPtr ? nmPtr : "unrecognized" )
-         << std::endl;
-      std::cout << "- # of channels: " << codecCtx->channels << std::endl;
-      std::cout << "- sample rate: " << codecCtx->sample_rate << " Hz"
-         << std::endl;
+      std::cout << '\n'
+         << "- filename:      " << getFileName(fileName) << '\n'
+         << "- audio codec:   " << codec->long_name << '\n'
+         << "- sample format: " << (nmPtr ? nmPtr : "unrecognized") << '\n'
+         << "- # of channels: " << codecCtx->channels << '\n'
+         << "- sample rate:   " << codecCtx->sample_rate << " Hz\n";
+
+      if ( frmCtx->metadata )
+       {
+         AVDictionaryEntry * mdp { nullptr };
+
+         std::cout << "\n--- metadata:\n";
+
+         while ( nullptr != (mdp = av_dict_get(frmCtx->metadata, "", mdp,
+                                             AV_DICT_IGNORE_SUFFIX)) )
+          {
+            auto const key { toLower(mdp->key) };
+
+            if ( "cuesheet" == key )
+               setTracksData(mdp->value);
+            else
+               std::cout << " - " << key << ": " << mdp->value << '\n';
+          }
+
+         if ( numTracks )
+          {
+            std::cout << "\n--- tracks\n";
+
+            for ( auto ui = 0U ; ui < numTracks ; ++ui )
+               writeTracks(ui, ' ');
+          }
+       }
+
+      std::cout << std::endl;
 
       auto const iFrm { formM.find(codecCtx->sample_fmt) };
 
@@ -260,12 +406,49 @@ struct audioData
        }
     }
 
+   template <typename T>
+   void writeTracks (std::size_t nTrk, T const & pre)
+    {
+      if ( nTrk < numTracks )
+         std::cout << pre << std::setfill(' ')
+            << std::setw(1+(9U<numTracks)) << (nTrk+1U) << " - "
+            << tracksData[nTrk].second << '\n';
+    }
+
+   void changeTrack (std::int64_t pos)
+    {
+      auto trk { numTracks };
+
+      ptrkPos = (numTracks > 1U ? tracksData[numTracks-2U].first : 0);
+      ttrkPos = tracksData.back().first;
+      ntrkPos = frmCtx->duration;
+
+      for ( auto ui { 1U } ; ui < trk ; ++ui )
+         if ( tracksData[ui].first >= pos )
+          {
+            trk     = ui;
+            ptrkPos = trk > 1U ? tracksData[trk-2U].first : 0;
+            ttrkPos = tracksData[trk-1U].first;
+            ntrkPos = tracksData[trk].first;
+          }
+
+      std::cout << "\n\n";
+
+      writeTracks(trk-2U, "      ");
+      writeTracks(trk-1U, " >>>  ");
+      writeTracks(trk   , "      ");
+
+      std::cout << '\n';
+    }
+
    void sdl_acb (std::uint8_t * stream, int len)
     {
       if ( len < 0 )
          throw std::runtime_error("negative request in sdl_acb");
 
       std::size_t uLen = len;
+
+      std::uint8_t * const cpStream { stream };
 
       if ( aPurged.exchange(false) )
        {
@@ -302,6 +485,10 @@ struct audioData
              {
                aPos = bd.second;
 
+               if ( numTracks
+                   && ((aPos >= ntrkPos) || (aPos < ttrkPos)) )
+                  changeTrack(aPos);
+
                std::size_t const newPS = (bd.second * tbNum) / tbDen;
 
                if ( newPS != oldPosS )
@@ -326,7 +513,9 @@ struct audioData
        }
       while ( loop && uLen );
 
-      if ( uLen )
+      if ( toQuit )
+         std::fill(cpStream, cpStream+len, std::uint8_t{0U});
+      else if ( uLen )
          std::fill(stream, stream+uLen, std::uint8_t{0U});
     }
 
@@ -353,13 +542,13 @@ void sdl_audio_callback (void * userdata, std::uint8_t * stream, int len)
 
 
 enum struct seek { noSeek, seekB1, seekB2, seekB3, seekF1, seekF2,
-                   seekF3, seekNextC, seekPrevC };
+                   seekF3, seekNT, seekPT };
 
 class keybHandl
  {
    public: 
       enum struct key { klP, klQ, kLeft, kRight, kUp, kDown, kPageUp,
-                        kPageDown, /* kHome, kEnd, */ kUndef };
+                        kPageDown, kHome, kEnd, kUndef };
 
    private:
 
@@ -392,7 +581,7 @@ class keybHandl
       ~keybHandl ()
        { tcsetattr(STDIN_FILENO, TCSANOW, &oldT); }
 
-      void initialize ()
+      void initialize (bool withTracks)
        {
          using namespace std::string_literals;
 
@@ -429,7 +618,7 @@ class keybHandl
                std::cerr << "error loading ksmx code; the arrows keys can"
                   " unavailable" << std::endl;
             else
-               (std::cout << pStr).flush(); // << std::endl;
+               (std::cout << pStr).flush();
 
             addSpecialKey("kl", key::kLeft);     // left arrow
             addSpecialKey("kr", key::kRight);    // right arrow
@@ -437,9 +626,12 @@ class keybHandl
             addSpecialKey("kd", key::kDown);     // up arrow
             addSpecialKey("kP", key::kPageUp);   // page up
             addSpecialKey("kN", key::kPageDown); // page down
-            // future uses
-            //addSpecialKey("kh", key::kHome);     // home
-            //addSpecialKey("@7", key::kEnd);      // end
+
+            if ( withTracks )
+             {
+               addSpecialKey("kh", key::kHome);     // home
+               addSpecialKey("@7", key::kEnd);      // end
+             }
           }
        }
 
@@ -521,7 +713,7 @@ class audioPlayer
                   case key::klP:
                      setPause( ! pause ); break;
                   case key::klQ:
-                     aLoop=false; setPause(false); break;
+                     aLoop=false; ad.toQuit=true; setPause(false); break;
                   case key::kLeft:
                      aSeek=seek::seekB1; setPause(false); break;
                   case key::kRight:
@@ -534,6 +726,10 @@ class audioPlayer
                      aSeek=seek::seekF3; setPause(false); break;
                   case key::kPageDown:
                      aSeek=seek::seekB3; setPause(false); break;
+                  case key::kHome:
+                     aSeek=seek::seekPT; setPause(false); break;
+                  case key::kEnd:
+                     aSeek=seek::seekNT; setPause(false); break;
                   default:
                      break;
                 }
@@ -548,19 +744,23 @@ class audioPlayer
 
          switch ( seekVal )
           {
-            case seek::seekB1: newPos =  -10; forwardFlag = 1; break;
-            case seek::seekF1: newPos =  +10; forwardFlag = 0; break;
-            case seek::seekB2: newPos =  -60; forwardFlag = 1; break;
-            case seek::seekF2: newPos =  +60; forwardFlag = 0; break;
-            case seek::seekB3: newPos = -600; forwardFlag = 1; break;
-            case seek::seekF3: newPos = +600; forwardFlag = 0; break;
+            case seek::seekB1: newPos =        -10; forwardFlag = 1; break;
+            case seek::seekF1: newPos =        +10; forwardFlag = 0; break;
+            case seek::seekB2: newPos =        -60; forwardFlag = 1; break;
+            case seek::seekF2: newPos =        +60; forwardFlag = 0; break;
+            case seek::seekB3: newPos =       -600; forwardFlag = 1; break;
+            case seek::seekF3: newPos =       +600; forwardFlag = 0; break;
+            case seek::seekPT: newPos = ad.ptrkPos; forwardFlag = 2; break;
+            case seek::seekNT: newPos = ad.ntrkPos; forwardFlag = 2; break;
 
             default: forwardFlag = -1; break;
           }
 
          if ( -1 != forwardFlag )
           {
-            if ( newPos )
+            if ( 2 == forwardFlag )
+               forwardFlag = (newPos < ad.aPos);
+            else
              {
                newPos *= ad.tbDen;
                newPos /= ad.tbNum;
@@ -585,7 +785,7 @@ class audioPlayer
       audioPlayer (std::string const & fileName)
        {
          ad.initialize(fileName);
-         kh.initialize();
+         kh.initialize(ad.numTracks > 0U);
 
          keybT = std::thread(&audioPlayer::keybReader, this);
 
