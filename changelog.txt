@@ -1,4 +1,12 @@
 
+0.2.0 - 2023.06.15
+
+- corrected a bug in the playing the last chunks of the audio file
+- new ring buffer for the check audio buffers
+- adaptation to more recent versions of libavformat and libswresample
+- improved track description
+- minor changes
+
 0.1.0 - 2018.05.27
 
 - metadata tags print added

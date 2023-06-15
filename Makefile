@@ -1,6 +1,6 @@
 
 #
-# Copyright (c) 2018 massimo morara
+# Copyright (c) 2018,2021,2023 massimo morara
 #
 # Permission is hereby granted, free of charge, to any person obtaining a
 # copy of this software and associated documentation files (the "Software"),
@@ -28,12 +28,12 @@
 
 CC        = g++
 DEFINES   = 
-CFLAGS    = -c -g -MD -MP -Wall -ansi -pedantic -std=c++14 -I. ${DEFINES}
+CFLAGS    = -c -g -O3 -MD -MP -Wall -ansi -pedantic -std=c++20 -I. ${DEFINES}
 
 LD        = g++
-LDFLAGS   = -std=c++14
-LDLIBS    = -lSDL2 -lavformat -lavcodec -lavutil -lswresample -lncurses \
-	    -lpthread
+LDFLAGS   = -std=c++20
+LDLIBS    = -lSDL2 -lavformat -lavcodec -lavutil -lncurses -lpthread \
+	    -lswresample
 
 OBJS = yasap.o
 
